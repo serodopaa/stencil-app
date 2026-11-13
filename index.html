@@ -164,6 +164,7 @@ input[type=color] { width: 34px; height: 28px; border: 1px solid var(--rule); bo
           <button id="modeLine" aria-pressed="false">Line art</button>
         </div>
         <div class="field"><label for="detail">Outline detail</label><output id="detailOut"></output><input id="detail" type="range" min="1" max="10" value="5"></div>
+        <div class="field" id="maxLineField"><label for="maxLine">Thickest line</label><output id="maxLineOut"></output><input id="maxLine" type="range" min="0" max="40" value="0"></div>
         <div class="field"><label for="smooth">Smoothing</label><output id="smoothOut"></output><input id="smooth" type="range" min="0" max="4" step="0.25" value="1.5"></div>
         <div class="field"><label for="minLen">Ignore specks under</label><output id="minLenOut"></output><input id="minLen" type="range" min="2" max="40" value="10"></div>
         <label class="inline" for="fillAreas"><input id="fillAreas" type="checkbox"> Fill and shade areas (off = lines only)</label>
@@ -372,14 +373,15 @@ function orderStrokes(strokes) {
     let best = -1, bd = Infinity, rev = false;
     for (let i = 0; i < strokes.length; i++) {
       if (used[i]) continue;
-      const s = strokes[i], a = s[0], b = s[s.length - 1];
+      const s = strokes[i].pts || strokes[i], a = s[0], b = s[s.length - 1];
       const da = (a[0] - px) ** 2 + (a[1] - py) ** 2, db = (b[0] - px) ** 2 + (b[1] - py) ** 2;
       if (da < bd) { bd = da; best = i; rev = false; }
       if (db < bd) { bd = db; best = i; rev = true; }
     }
     used[best] = 1;
-    const s = rev ? strokes[best].slice().reverse() : strokes[best];
-    out.push(s); [px, py] = s[s.length - 1];
+    const o = strokes[best];
+    const s = !rev ? o : o.pts ? { ...o, pts: o.pts.slice().reverse() } : o.slice().reverse();
+    out.push(s); const sp = s.pts || s; [px, py] = sp[sp.length - 1];
   }
   return out;
 }
@@ -417,7 +419,7 @@ function hatch(g, w, h, levels, spacing) {
 function params() {
   return {
     detail: +$("detail").value, smooth: +$("smooth").value, minLen: +$("minLen").value,
-    levels: +$("levels").value, spacing: +$("spacing").value, useColor: $("useColor").checked, fill: $("fillAreas").checked
+    levels: +$("levels").value, spacing: +$("spacing").value, maxLine: +$("maxLine").value, useColor: $("useColor").checked, fill: $("fillAreas").checked
   };
 }
 
@@ -523,8 +525,28 @@ function rebuild() {
   if (S.mode === "line") {
     // Line art: trace the centre of each inked line at its real thickness.
     const g = blur(S.gray, W, H, p.smooth * 0.4), thr = 60 + p.detail * 15;
+    const ink = new Uint8Array(W * H);
+    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) { const i = y * W + x; if (g[i] < thr) ink[i] = 1; }
+    // Separate pen lines from painted areas by width. The distance map's ridge values give each
+    // line's half-width; anything with a core thicker than the thickest line is a painted area.
+    const dtInk = distT(ink, W, H), ridge = [];
+    for (let i = W + 1; i < W * H - W - 1; i++) {
+      const v = dtInk[i];
+      if (v && v >= dtInk[i - 1] && v >= dtInk[i + 1] && v >= dtInk[i - W] && v >= dtInk[i + W]) ridge.push(v);
+    }
+    ridge.sort((a, b) => a - b);
+    const med = ridge.length ? ridge[ridge.length >> 1] : 1;
+    const T = p.maxLine ? p.maxLine / 2 : Math.min(10, Math.max(4, med * 4));
+    S.autoMaxLine = Math.round(T * 2);
+    const notCore = new Uint8Array(W * H);
+    for (let i = 0; i < W * H; i++) notCore[i] = dtInk[i] > T ? 0 : 1;
+    const dCore = distT(notCore, W, H), blob = new Uint8Array(W * H);
     E = new Uint8Array(W * H);
-    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) { const i = y * W + x; if (g[i] < thr) E[i] = 1; }
+    for (let i = 0; i < W * H; i++) if (ink[i]) { if (dCore[i] <= T + 0.5) blob[i] = 1; else E[i] = 1; }
+    // Painted areas are traced around their edge, where they meet bare paper.
+    const edge = new Uint8Array(W * H);
+    for (let i = W + 1; i < W * H - W - 1; i++)
+      if (blob[i] && (!ink[i - 1] || !ink[i + 1] || !ink[i - W] || !ink[i + W])) edge[i] = 1;
     const dt = distT(E, W, H), skel = thin(E, W, H);
     const d0 = S.rgb, chains = [];
     // Split each centerline wherever the ink colour changes (e.g. a purple line meeting a black one).
@@ -543,10 +565,16 @@ function rebuild() {
         }
       }
     }
-    S.outlines = orderStrokes(chains.map(c => chaikin(rdp(c, 0.6)))).map(pts => {
+    const lineObjs = chains.map(c => chaikin(densify(rdp(c, 0.6), 6))).map(pts => {
       let sum = 0; for (const [x, y] of pts) sum += dt[Math.round(y) * W + Math.round(x)] || 1;
-      return { pts, t: Math.max(0.8, 2 * sum / pts.length - 1), c: avgColor(pts) };
+      return { pts, t: Math.min(2 * T, Math.max(0.8, 2 * sum / pts.length - 1)), c: avgColor(pts) };
     });
+    const edgeT = Math.max(0.8, 2 * med - 1);
+    const areaObjs = traceChains(thin(edge, W, H), W, H).filter(c => c.length >= p.minLen)
+      .map(c => chaikin(densify(rdp(c, 0.8), 6))).map(pts => ({ pts, t: edgeT, c: avgColor(pts), area: true }));
+    S.areaCount = areaObjs.length;
+    S.outlines = orderStrokes([...lineObjs, ...areaObjs]);
+    for (let i = 0; i < W * H; i++) if (edge[i]) E[i] = 1;
     // Fill areas: coloured paper that is not ink (with a 1px margin off the lines).
     const fill = new Uint8Array(W * H), d = S.rgb;
     tone = new Float32Array(W * H).fill(255);
@@ -564,7 +592,7 @@ function rebuild() {
   } else {
     const g = normalize(blur(S.gray, W, H, p.smooth));
     E = canny(g, W, H, p.detail);
-    S.outlines = orderStrokes(traceChains(E, W, H).filter(c => c.length >= p.minLen).map(c => chaikin(rdp(c, 0.9))))
+    S.outlines = orderStrokes(traceChains(E, W, H).filter(c => c.length >= p.minLen).map(c => chaikin(densify(rdp(c, 0.9), 6))))
       .map(pts => ({ pts, c: avgColor(pts, 0.6) }));
     tone = normalize(blur(S.gray, W, H, Math.max(2, p.smooth * 2)));
     S.hatches = p.levels ? hatch(tone, W, H, p.levels, p.spacing).map(pts => ({ pts, c: avgColor(pts, 0.85), hatch: true })) : [];
@@ -572,7 +600,8 @@ function rebuild() {
   if (!p.fill) S.hatches = [];
   renderStencil(E, tone, p.fill ? (p.levels || 3) : 0);
   const ol = S.outlines.reduce((a, s) => a + pathLen(s.pts), 0), hl = S.hatches.reduce((a, s) => a + pathLen(s.pts), 0);
-  $("stats").innerHTML = `${S.outlines.length.toLocaleString()} outline strokes<br>${S.hatches.length.toLocaleString()} ${S.mode === "line" && p.useColor ? "colour fill" : "hatch"} lines<br>${Math.round(ol + hl).toLocaleString()} px of pen travel`;
+  $("stats").innerHTML = `${S.outlines.length.toLocaleString()} outline strokes<br>${S.hatches.length.toLocaleString()} ${S.mode === "line" && p.useColor ? "colour fill" : "hatch"} lines${S.mode === "line" && S.areaCount ? `<br>${S.areaCount.toLocaleString()} painted-area edges` : ""}<br>${Math.round(ol + hl).toLocaleString()} px of pen travel`;
+  $("maxLineOut").textContent = fmt.maxLine($("maxLine").value);
   drawUnder();
 }
 
@@ -580,6 +609,7 @@ function setMode(m, rerun = true) {
   S.mode = m;
   $("modePhoto").setAttribute("aria-pressed", m === "photo");
   $("modeLine").setAttribute("aria-pressed", m === "line");
+  $("maxLineField").hidden = m !== "line";
   $("detail").previousElementSibling.previousElementSibling.textContent = m === "line" ? "Ink threshold" : "Outline detail";
   if (rerun) rebuild();
 }
@@ -770,7 +800,7 @@ $("modal").onclick = e => { if (e.target === $("modal")) $("modal").hidden = tru
 const fmt = {
   speed: v => ["crawl", "slow", "slow", "steady", "steady", "brisk", "fast", "fast", "rapid", "instant"][v - 1],
   width: v => (+v).toFixed(2) + " px", detail: v => v + "/10", smooth: v => "σ " + (+v).toFixed(2),
-  minLen: v => v + " px", levels: v => v == 0 ? "outlines only" : v, spacing: v => (+v).toFixed(1) + " px", opacity: v => v + "%"
+  minLen: v => v + " px", maxLine: v => v == 0 ? (S.autoMaxLine ? `auto (${S.autoMaxLine} px)` : "auto") : v + " px", levels: v => v == 0 ? "outlines only" : v, spacing: v => (+v).toFixed(1) + " px", opacity: v => v + "%"
 };
 let timer = 0;
 for (const id of Object.keys(fmt)) {
@@ -780,7 +810,7 @@ for (const id of Object.keys(fmt)) {
   el.addEventListener("input", () => {
     show();
     if (id === "opacity") drawUnder();
-    if (["detail", "smooth", "minLen", "levels", "spacing"].includes(id)) {
+    if (["detail", "smooth", "minLen", "levels", "spacing", "maxLine"].includes(id)) {
       clearTimeout(timer); timer = setTimeout(rebuild, 180);
     }
   });
