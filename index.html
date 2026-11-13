@@ -149,7 +149,7 @@ input[type=color] { width: 34px; height: 28px; border: 1px solid var(--rule); bo
         </div>
         <div class="field"><label for="width">Line weight</label><output id="widthOut"></output><input id="width" type="range" min="0.5" max="5" step="0.25" value="1.5"></div>
         <div class="inline"><label for="color">Ink</label><input id="color" type="color" value="#23272c">
-          <label class="inline" for="useColor" style="margin-left:auto"><input id="useColor" type="checkbox" checked> Use source colours</label></div>
+          <label class="inline" for="useColor" style="margin-left:auto"><input id="useColor" type="checkbox"> Use source colours</label></div>
         <div class="row">
           <button class="btn" id="undo">Undo</button>
           <button class="btn" id="clear">Clear</button>
@@ -166,6 +166,7 @@ input[type=color] { width: 34px; height: 28px; border: 1px solid var(--rule); bo
         <div class="field"><label for="detail">Outline detail</label><output id="detailOut"></output><input id="detail" type="range" min="1" max="10" value="5"></div>
         <div class="field"><label for="smooth">Smoothing</label><output id="smoothOut"></output><input id="smooth" type="range" min="0" max="4" step="0.25" value="1.5"></div>
         <div class="field"><label for="minLen">Ignore specks under</label><output id="minLenOut"></output><input id="minLen" type="range" min="2" max="40" value="10"></div>
+        <label class="inline" for="fillAreas"><input id="fillAreas" type="checkbox"> Fill and shade areas (off = lines only)</label>
         <div class="field"><label for="levels">Shading tones</label><output id="levelsOut"></output><input id="levels" type="range" min="0" max="4" value="3"></div>
         <div class="field"><label for="spacing">Hatch spacing</label><output id="spacingOut"></output><input id="spacing" type="range" min="2" max="12" step="0.5" value="4"></div>
         <div class="stats" id="stats"></div>
@@ -416,7 +417,7 @@ function hatch(g, w, h, levels, spacing) {
 function params() {
   return {
     detail: +$("detail").value, smooth: +$("smooth").value, minLen: +$("minLen").value,
-    levels: +$("levels").value, spacing: +$("spacing").value, useColor: $("useColor").checked
+    levels: +$("levels").value, spacing: +$("spacing").value, useColor: $("useColor").checked, fill: $("fillAreas").checked
   };
 }
 
@@ -568,7 +569,8 @@ function rebuild() {
     tone = normalize(blur(S.gray, W, H, Math.max(2, p.smooth * 2)));
     S.hatches = p.levels ? hatch(tone, W, H, p.levels, p.spacing).map(pts => ({ pts, c: avgColor(pts, 0.85), hatch: true })) : [];
   }
-  renderStencil(E, tone, p.levels || 3);
+  if (!p.fill) S.hatches = [];
+  renderStencil(E, tone, p.fill ? (p.levels || 3) : 0);
   const ol = S.outlines.reduce((a, s) => a + pathLen(s.pts), 0), hl = S.hatches.reduce((a, s) => a + pathLen(s.pts), 0);
   $("stats").innerHTML = `${S.outlines.length.toLocaleString()} outline strokes<br>${S.hatches.length.toLocaleString()} ${S.mode === "line" && p.useColor ? "colour fill" : "hatch"} lines<br>${Math.round(ol + hl).toLocaleString()} px of pen travel`;
   drawUnder();
@@ -733,6 +735,7 @@ $("toolErase").onclick = () => { if (S.job) S.job.running = false, $("pause").te
 $("modePhoto").onclick = () => setMode("photo");
 $("modeLine").onclick = () => setMode("line");
 $("useColor").onchange = () => rebuild();
+$("fillAreas").onchange = () => rebuild();
 $("ulStencil").onclick = () => setUnderlay("stencil");
 $("ulPhoto").onclick = () => setUnderlay("photo");
 $("ulNone").onclick = () => setUnderlay("none");
