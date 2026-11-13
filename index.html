@@ -148,7 +148,8 @@ input[type=color] { width: 34px; height: 28px; border: 1px solid var(--rule); bo
           <button id="toolErase" aria-pressed="false">Eraser</button>
         </div>
         <div class="field"><label for="width">Line weight</label><output id="widthOut"></output><input id="width" type="range" min="0.5" max="5" step="0.25" value="1.5"></div>
-        <div class="inline"><label for="color">Ink</label><input id="color" type="color" value="#23272c"></div>
+        <div class="inline"><label for="color">Ink</label><input id="color" type="color" value="#23272c">
+          <label class="inline" for="useColor" style="margin-left:auto"><input id="useColor" type="checkbox" checked> Use source colours</label></div>
         <div class="row">
           <button class="btn" id="undo">Undo</button>
           <button class="btn" id="clear">Clear</button>
@@ -158,6 +159,10 @@ input[type=color] { width: 34px; height: 28px; border: 1px solid var(--rule); bo
 
       <div class="group">
         <h2>Stencil</h2>
+        <div class="seg" role="group" aria-label="Source type" style="grid-template-columns:1fr 1fr">
+          <button id="modePhoto" aria-pressed="true">Photo</button>
+          <button id="modeLine" aria-pressed="false">Line art</button>
+        </div>
         <div class="field"><label for="detail">Outline detail</label><output id="detailOut"></output><input id="detail" type="range" min="1" max="10" value="5"></div>
         <div class="field"><label for="smooth">Smoothing</label><output id="smoothOut"></output><input id="smooth" type="range" min="0" max="4" step="0.25" value="1.5"></div>
         <div class="field"><label for="minLen">Ignore specks under</label><output id="minLenOut"></output><input id="minLen" type="range" min="2" max="40" value="10"></div>
@@ -201,7 +206,7 @@ const uctx = under.getContext("2d"), dctx = draw.getContext("2d");
 
 const S = {
   W: 0, H: 0, photo: null, stencil: null, gray: null,
-  outlines: [], hatches: [], job: null, tool: "auto", underlay: "stencil", undo: []
+  outlines: [], hatches: [], job: null, tool: "auto", underlay: "stencil", undo: [], mode: "photo", rgb: null
 };
 
 /* ---------- image processing ---------- */
@@ -411,7 +416,7 @@ function hatch(g, w, h, levels, spacing) {
 function params() {
   return {
     detail: +$("detail").value, smooth: +$("smooth").value, minLen: +$("minLen").value,
-    levels: +$("levels").value, spacing: +$("spacing").value
+    levels: +$("levels").value, spacing: +$("spacing").value, useColor: $("useColor").checked
   };
 }
 
@@ -426,27 +431,155 @@ function loadSource(src) {
   const d = pctx.getImageData(0, 0, W, H).data;
   S.gray = new Float32Array(W * H);
   for (let i = 0; i < W * H; i++) S.gray[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  S.rgb = d;
+  // Guess the source type: drawings are mostly blank paper with a little dark ink.
+  let white = 0, dark = 0;
+  for (let i = 0; i < W * H; i++) { if (S.gray[i] > 235) white++; else if (S.gray[i] < 120) dark++; }
+  setMode(white > W * H * 0.45 && dark < W * H * 0.15 ? "line" : "photo", false);
   under.width = draw.width = W * SCALE; under.height = draw.height = H * SCALE;
   sheet.style.setProperty("--ar", (W / H).toFixed(4));
   stopJob(); S.undo = []; dctx.clearRect(0, 0, draw.width, draw.height); setProgress(0);
   rebuild();
 }
 
+function thin(M, w, h) {
+  // Zhang-Suen thinning: reduce ink lines to 1px centerlines.
+  const m = Uint8Array.from(M), del = [];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let pass = 0; pass < 2; pass++) {
+      del.length = 0;
+      for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+        const i = y * w + x; if (!m[i]) continue;
+        const p2 = m[i - w], p3 = m[i - w + 1], p4 = m[i + 1], p5 = m[i + w + 1], p6 = m[i + w], p7 = m[i + w - 1], p8 = m[i - 1], p9 = m[i - w - 1];
+        const B = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9; if (B < 2 || B > 6) continue;
+        const A = (!p2 && p3) + (!p3 && p4) + (!p4 && p5) + (!p5 && p6) + (!p6 && p7) + (!p7 && p8) + (!p8 && p9) + (!p9 && p2);
+        if (A !== 1) continue;
+        if (pass === 0 ? (p2 && p4 && p6) || (p4 && p6 && p8) : (p2 && p4 && p8) || (p2 && p6 && p8)) continue;
+        del.push(i);
+      }
+      for (const i of del) m[i] = 0;
+      if (del.length) changed = true;
+    }
+  }
+  return m;
+}
+
+function distT(M, w, h) {
+  const d = new Float32Array(w * h), R = Math.SQRT2;
+  for (let i = 0; i < w * h; i++) d[i] = M[i] ? 1e9 : 0;
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x; if (!d[i]) continue;
+    d[i] = Math.min(d[i], d[i - 1] + 1, d[i - w] + 1, d[i - w - 1] + R, d[i - w + 1] + R);
+  }
+  for (let y = h - 2; y > 0; y--) for (let x = w - 2; x > 0; x--) {
+    const i = y * w + x; if (!d[i]) continue;
+    d[i] = Math.min(d[i], d[i + 1] + 1, d[i + w] + 1, d[i + w + 1] + R, d[i + w - 1] + R);
+  }
+  return d;
+}
+
+function avgColor(pts, darken = 1) {
+  const { W, H, rgb } = S; let r = 0, g = 0, b = 0, n = 0;
+  for (const [x, y] of pts) {
+    const xi = Math.min(W - 1, Math.max(0, Math.round(x))), yi = Math.min(H - 1, Math.max(0, Math.round(y)));
+    const k = (yi * W + xi) * 4; r += rgb[k]; g += rgb[k + 1]; b += rgb[k + 2]; n++;
+  }
+  return [r / n * darken | 0, g / n * darken | 0, b / n * darken | 0];
+}
+
+// Hatch a mask in the colours underneath it; a run breaks wherever the colour changes.
+function colorHatch(fill, w, h, spacing, angDeg) {
+  const rgb = S.rgb, strokes = [], diag = Math.hypot(w, h);
+  const ang = angDeg * Math.PI / 180, dx = Math.cos(ang), dy = Math.sin(ang), nx = -dy, ny = dx;
+  let flip = false;
+  for (let t = -diag / 2; t < diag / 2; t += spacing) {
+    const cx = w / 2 + nx * t, cy = h / 2 + ny * t, runs = [];
+    let run = null, last = null, base = null, sum = null;
+    const close = () => { if (run) { run.push(last); if (pathLen(run) >= 2) runs.push({ pts: run, c: sum.slice(0, 3).map(v => v / sum[3] | 0), hatch: true }); } run = null; };
+    for (let s = -diag / 2; s <= diag / 2; s += 1) {
+      const x = cx + dx * s, y = cy + dy * s, xi = x | 0, yi = y | 0;
+      const inside = x >= 0 && y >= 0 && xi < w && yi < h && fill[yi * w + xi];
+      if (!inside) { close(); continue; }
+      const k = (yi * w + xi) * 4, col = [rgb[k], rgb[k + 1], rgb[k + 2]];
+      if (run && Math.abs(col[0] - base[0]) + Math.abs(col[1] - base[1]) + Math.abs(col[2] - base[2]) > 60) close();
+      if (!run) { run = [[x, y]]; base = col; sum = [0, 0, 0, 0]; }
+      sum[0] += col[0]; sum[1] += col[1]; sum[2] += col[2]; sum[3]++; last = [x, y];
+    }
+    close();
+    if (flip) runs.reverse().forEach(r => r.pts.reverse());
+    flip = !flip;
+    strokes.push(...runs);
+  }
+  return strokes;
+}
+
 function rebuild() {
   if (!S.gray) return;
   const p = params(), { W, H } = S;
-  const g = normalize(blur(S.gray, W, H, p.smooth));
-  const E = canny(g, W, H, p.detail);
-  const chains = traceChains(E, W, H)
-    .filter(c => c.length >= p.minLen)
-    .map(c => chaikin(rdp(c, 0.9)));
-  S.outlines = orderStrokes(chains);
-  const tone = normalize(blur(S.gray, W, H, Math.max(2, p.smooth * 2)));
-  S.hatches = p.levels ? hatch(tone, W, H, p.levels, p.spacing) : [];
-  renderStencil(E, tone, p.levels);
-  const ol = S.outlines.reduce((a, s) => a + pathLen(s), 0), hl = S.hatches.reduce((a, s) => a + pathLen(s), 0);
-  $("stats").innerHTML = `${S.outlines.length.toLocaleString()} outline strokes<br>${S.hatches.length.toLocaleString()} hatch lines<br>${Math.round(ol + hl).toLocaleString()} px of pen travel`;
+  let E, tone;
+  if (S.mode === "line") {
+    // Line art: trace the centre of each inked line at its real thickness.
+    const g = blur(S.gray, W, H, p.smooth * 0.4), thr = 60 + p.detail * 15;
+    E = new Uint8Array(W * H);
+    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) { const i = y * W + x; if (g[i] < thr) E[i] = 1; }
+    const dt = distT(E, W, H), skel = thin(E, W, H);
+    const d0 = S.rgb, chains = [];
+    // Split each centerline wherever the ink colour changes (e.g. a purple line meeting a black one).
+    for (const c of traceChains(skel, W, H)) {
+      if (c.length < p.minLen) continue;
+      const col = c.map(([x, y]) => { const k = (y * W + x) * 4; return [d0[k], d0[k + 1], d0[k + 2]]; });
+      let start = 0, ref = col[0];
+      for (let i = 1; i <= c.length; i++) {
+        const diff = i < c.length ? Math.abs(col[i][0] - ref[0]) + Math.abs(col[i][1] - ref[1]) + Math.abs(col[i][2] - ref[2]) : Infinity;
+        // require the new colour to persist for a few pixels before splitting
+        const persists = i < c.length && col.slice(i, i + 4).every(q => Math.abs(q[0] - ref[0]) + Math.abs(q[1] - ref[1]) + Math.abs(q[2] - ref[2]) > 110);
+        if (i === c.length || (diff > 110 && persists && i - start >= 3)) {
+          const seg = c.slice(start, Math.min(c.length, i + 1));
+          if (seg.length >= 2) chains.push(seg);
+          start = i; ref = col[i] || ref;
+        }
+      }
+    }
+    S.outlines = orderStrokes(chains.map(c => chaikin(rdp(c, 0.6)))).map(pts => {
+      let sum = 0; for (const [x, y] of pts) sum += dt[Math.round(y) * W + Math.round(x)] || 1;
+      return { pts, t: Math.max(0.8, 2 * sum / pts.length - 1), c: avgColor(pts) };
+    });
+    // Fill areas: coloured paper that is not ink (with a 1px margin off the lines).
+    const fill = new Uint8Array(W * H), d = S.rgb;
+    tone = new Float32Array(W * H).fill(255);
+    let maxDark = 1;
+    for (let i = 0; i < W * H; i++) {
+      if (dt[i] || dt[i - 1] || dt[i + 1] || dt[i - W] || dt[i + W]) continue;
+      const r = d[i * 4], gg = d[i * 4 + 1], b = d[i * 4 + 2];
+      if (S.gray[i] < 238 || Math.max(r, gg, b) - Math.min(r, gg, b) > 18) { fill[i] = 1; tone[i] = S.gray[i]; maxDark = Math.max(maxDark, 255 - S.gray[i]); }
+    }
+    const k = 0.8 / (maxDark / 255);
+    for (let i = 0; i < W * H; i++) if (fill[i]) tone[i] = 255 - (255 - tone[i]) * k;
+    if (!p.levels) S.hatches = [];
+    else if (p.useColor) S.hatches = colorHatch(fill, W, H, p.spacing, 45);
+    else S.hatches = hatch(tone, W, H, p.levels, p.spacing).map(pts => ({ pts, hatch: true }));
+  } else {
+    const g = normalize(blur(S.gray, W, H, p.smooth));
+    E = canny(g, W, H, p.detail);
+    S.outlines = orderStrokes(traceChains(E, W, H).filter(c => c.length >= p.minLen).map(c => chaikin(rdp(c, 0.9))))
+      .map(pts => ({ pts, c: avgColor(pts, 0.6) }));
+    tone = normalize(blur(S.gray, W, H, Math.max(2, p.smooth * 2)));
+    S.hatches = p.levels ? hatch(tone, W, H, p.levels, p.spacing).map(pts => ({ pts, c: avgColor(pts, 0.85), hatch: true })) : [];
+  }
+  renderStencil(E, tone, p.levels || 3);
+  const ol = S.outlines.reduce((a, s) => a + pathLen(s.pts), 0), hl = S.hatches.reduce((a, s) => a + pathLen(s.pts), 0);
+  $("stats").innerHTML = `${S.outlines.length.toLocaleString()} outline strokes<br>${S.hatches.length.toLocaleString()} ${S.mode === "line" && p.useColor ? "colour fill" : "hatch"} lines<br>${Math.round(ol + hl).toLocaleString()} px of pen travel`;
   drawUnder();
+}
+
+function setMode(m, rerun = true) {
+  S.mode = m;
+  $("modePhoto").setAttribute("aria-pressed", m === "photo");
+  $("modeLine").setAttribute("aria-pressed", m === "line");
+  $("detail").previousElementSibling.previousElementSibling.textContent = m === "line" ? "Ink threshold" : "Outline detail";
+  if (rerun) rebuild();
 }
 
 function renderStencil(E, tone, levels) {
@@ -493,16 +626,21 @@ function pushUndo() {
 function startAuto() {
   if (!S.gray) return;
   stopJob(); pushUndo();
-  const w = +$("width").value;
-  const plan = [
-    ...S.outlines.map(p => ({ pts: densify(p, 4), w })),
-    ...S.hatches.map(p => ({ pts: densify(p, 6), w: Math.max(0.4, w * 0.55) }))
-  ];
+  const w = +$("width").value, useColor = $("useColor").checked, ink = $("color").value;
+  const css = s => useColor && s.c ? `rgb(${s.c[0]},${s.c[1]},${s.c[2]})` : ink;
+  const colourFill = S.mode === "line" && useColor;
+  const hatchW = colourFill ? Math.max(0.6, +$("spacing").value * 1.05) : Math.max(0.4, w * 0.55);
+  // Colour fills go down first so the ink lines sit on top, as in the source.
+  const lines = S.outlines.map(s => ({ pts: densify(s.pts, 4), w: s.t ? s.t * w / 1.5 : w, style: css(s) }));
+  const fills = S.hatches.map(s => ({ pts: densify(s.pts, 6), w: hatchW, style: css(s) }));
+  const plan = colourFill ? [...fills, ...lines] : [...lines, ...fills];
+  S.firstPhase = colourFill ? fills.length : lines.length;
   const total = plan.reduce((a, s) => a + s.pts.length - 1, 0) || 1;
   S.job = { plan, si: 0, pi: 1, done: 0, total, running: true };
   setTool("auto");
   $("pause").disabled = $("finish").disabled = false; $("pause").textContent = "Pause";
-  $("status").textContent = "Tracing outlines…";
+  $("status").textContent = colourFill ? "Colouring in…" : "Tracing outlines…";
+  S.phaseMsg = colourFill ? "Inking the lines…" : "Shading tones…";
   tip.hidden = false;
   requestAnimationFrame(step);
 }
@@ -518,12 +656,12 @@ function step() {
 function advance(j, budget) {
   dctx.setTransform(SCALE, 0, 0, SCALE, 0, 0);
   dctx.lineCap = "round"; dctx.lineJoin = "round";
-  dctx.strokeStyle = $("color").value; dctx.globalCompositeOperation = "source-over";
-  let curW = -1;
+  dctx.globalCompositeOperation = "source-over";
+  let curW = -1, curS = "";
   dctx.beginPath();
   while (budget > 0 && j.si < j.plan.length) {
     const s = j.plan[j.si];
-    if (s.w !== curW) { dctx.stroke(); dctx.beginPath(); dctx.lineWidth = curW = s.w; }
+    if (s.w !== curW || s.style !== curS) { dctx.stroke(); dctx.beginPath(); dctx.lineWidth = curW = s.w; dctx.strokeStyle = curS = s.style; }
     const a = s.pts[j.pi - 1], b = s.pts[j.pi];
     dctx.moveTo(a[0], a[1]); dctx.lineTo(b[0], b[1]);
     budget -= Math.hypot(b[0] - a[0], b[1] - a[1]) + 0.5;
@@ -533,7 +671,7 @@ function advance(j, budget) {
   dctx.stroke();
   setProgress(j.done / j.total);
   if (j.pen) { tip.style.left = (j.pen[0] / S.W * 100) + "%"; tip.style.top = (j.pen[1] / S.H * 100) + "%"; }
-  if (j.si >= S.outlines.length && S.hatches.length) $("status").textContent = "Shading tones…";
+  if (j.si >= S.firstPhase && j.si < j.plan.length) $("status").textContent = S.phaseMsg;
 }
 
 function finishJob() {
@@ -592,6 +730,9 @@ function setUnderlay(u) {
 $("toolAuto").onclick = () => setTool("auto");
 $("toolPen").onclick = () => { if (S.job) S.job.running = false, $("pause").textContent = "Resume"; setTool("pen"); };
 $("toolErase").onclick = () => { if (S.job) S.job.running = false, $("pause").textContent = "Resume"; setTool("erase"); };
+$("modePhoto").onclick = () => setMode("photo");
+$("modeLine").onclick = () => setMode("line");
+$("useColor").onchange = () => rebuild();
 $("ulStencil").onclick = () => setUnderlay("stencil");
 $("ulPhoto").onclick = () => setUnderlay("photo");
 $("ulNone").onclick = () => setUnderlay("none");
